@@ -28,6 +28,7 @@ import (
 	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/kubectl"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
@@ -56,6 +57,9 @@ var (
 
 		# Update a single-container pod's image version (tag) to v4
 		kubectl get pod mypod -o yaml | sed 's/\(image: myimage\):.*$/\1:v4/' | kubectl replace -f -
+
+		# Replace a deployment using the data in deployment.json and save the config in its annotation.
+		kubectl replace -f ./deployment.json --save-config
 
 		# Force replace, delete and then re-create the resource
 		kubectl replace --force -f ./pod.json`)
@@ -86,7 +90,8 @@ func NewCmdReplace(f cmdutil.Factory, out io.Writer) *cobra.Command {
 	cmd.Flags().Duration("timeout", 0, "Only relevant during a force replace. The length of time to wait before giving up on a delete of the old resource, zero means determine a timeout from the size of the object. Any other values should contain a corresponding time unit (e.g. 1s, 2m, 3h).")
 	cmdutil.AddValidateFlags(cmd)
 	cmdutil.AddOutputFlagsForMutation(cmd)
-	cmdutil.AddApplyAnnotationFlags(cmd)
+	overrideMsg := "If true, the configuration of current object will be saved in its annotation. If false and the user-provided config doesn't have the annotation, we will save the annotation from the live object if there are any. If false and the user-provided config has the annotation, we will use the user-provided annotation. This flag is useful when you want to perform kubectl apply on this object in the future."
+	cmdutil.AddApplyAnnotationFlagsWithMsg(cmd, overrideMsg)
 	cmdutil.AddRecordFlag(cmd)
 	cmdutil.AddInclude3rdPartyFlags(cmd)
 
@@ -146,7 +151,12 @@ func RunReplace(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []str
 			return err
 		}
 
-		if err := kubectl.CreateOrUpdateAnnotation(cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag), info, f.JSONEncoder()); err != nil {
+		saveConfig := cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag)
+		lcl, err := newGetResources(false, nil)
+		if err != nil {
+			return cmdutil.AddSourceToErr("replacing", info.Source, err)
+		}
+		if err := handleApplyAnnotation(info, saveConfig, lcl, f.JSONEncoder()); err != nil {
 			return cmdutil.AddSourceToErr("replacing", info.Source, err)
 		}
 
@@ -200,7 +210,26 @@ func forceReplace(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []s
 	if err != nil {
 		return err
 	}
+
 	r := resource.NewBuilder(mapper, typer, resource.ClientMapperFunc(f.UnstructuredClientForMapping), unstructured.UnstructuredJSONScheme).
+		ContinueOnError().
+		NamespaceParam(cmdNamespace).DefaultNamespace().
+		FilenameParam(enforceNamespace, options).
+		ResourceTypeOrNameArgs(false, args...).RequireObject(false).
+		Latest().
+		Flatten().
+		Do().
+		IgnoreErrors(errors.IsNotFound)
+	err = r.Err()
+	if err != nil {
+		return err
+	}
+	liveInfos, err := r.Infos()
+	if err != nil {
+		return err
+	}
+
+	r = resource.NewBuilder(mapper, typer, resource.ClientMapperFunc(f.UnstructuredClientForMapping), unstructured.UnstructuredJSONScheme).
 		ContinueOnError().
 		NamespaceParam(cmdNamespace).DefaultNamespace().
 		FilenameParam(enforceNamespace, options).
@@ -211,6 +240,7 @@ func forceReplace(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []s
 	if err != nil {
 		return err
 	}
+
 	//Replace will create a resource if it doesn't exist already, so ignore not found error
 	ignoreNotFound := true
 	timeout := cmdutil.GetFlagDuration(cmd, "timeout")
@@ -267,8 +297,13 @@ func forceReplace(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []s
 			return err
 		}
 
-		if err := kubectl.CreateOrUpdateAnnotation(cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag), info, f.JSONEncoder()); err != nil {
-			return err
+		saveConfig := cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag)
+		lcl, err := newGetResources(true, liveInfos)
+		if err != nil {
+			return cmdutil.AddSourceToErr("replacing", info.Source, err)
+		}
+		if err := handleApplyAnnotation(info, saveConfig, lcl, f.JSONEncoder()); err != nil {
+			return cmdutil.AddSourceToErr("replacing", info.Source, err)
 		}
 
 		if cmdutil.ShouldRecord(cmd, info) {
@@ -295,4 +330,129 @@ func forceReplace(f cmdutil.Factory, out io.Writer, cmd *cobra.Command, args []s
 		return fmt.Errorf("no objects passed to replace")
 	}
 	return nil
+}
+
+// If saveConfig is true, create or update the annotation.
+// If saveConfig is false and the local config file doesn't have the annotation, we save the annotation from the live object if there is one.
+// If saveConfig is false and the local config file has the annotation, we use the annotation in the config file.
+// info is the resource need to process. saveConfig indicate if we want to save the config in the annotation.
+func handleApplyAnnotation(info *resource.Info, saveConfig bool, lcl lastConfigurationLookup, encoder runtime.Encoder) error {
+	if saveConfig {
+		if err := kubectl.CreateOrUpdateAnnotation(true, info, encoder); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	anno, err := kubectl.GetOriginalConfiguration(info.Mapping, info.Object)
+	if err != nil {
+		return err
+	}
+	// The user-provided config doesn't have the annotation, try to get it from live object
+	if anno == nil {
+		annotationFromLiveObj, err := lcl.getAnnotationForResource(info)
+		if err != nil {
+			return err
+		}
+		if err = kubectl.SetOriginalConfiguration(info, annotationFromLiveObj); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// newGetResources is the factory method returning an object that implements lastConfigurationLookup interface
+func newGetResources(force bool, infos []*resource.Info) (lastConfigurationLookup, error) {
+	if force {
+		return buildMap(infos)
+	} else {
+		return lazyResources{}, nil
+	}
+}
+
+type lastConfigurationLookup interface {
+	getAnnotationForResource(info *resource.Info) ([]byte, error)
+}
+
+// lazyResources takes a list of resource that will be lazily read from the apiserver when they are needed.
+type lazyResources struct{}
+
+// getAnnotationForResource returns the annotation by fetching from the api server.
+func (lr lazyResources) getAnnotationForResource(info *resource.Info) ([]byte, error) {
+	// save the the local obj before the live obj overwrite it
+	localObj := info.Object
+	err := info.Get()
+	// If the resource is not found in the server, ignore the error
+	switch {
+	case errors.IsNotFound(err):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+	anno, err := kubectl.GetOriginalConfiguration(info.Mapping, info.Object)
+	// restore the local obj
+	info.Object = localObj
+	return anno, err
+}
+
+// eagerResources takes a list of live resources eagerly read from the apiserver
+type eagerResources struct {
+	// lookup keeps the mapping of resourceType to the last-applied-config annotation
+	lookup map[resourceType][]byte
+}
+
+// resourceType is used to check if 2 objects are the same one
+type resourceType struct {
+	ApiVersion string
+	Kind       string
+	Name       string
+}
+
+// buildMap constructs the mapping(resourceType->annotation) for all the objects in infos
+func buildMap(infos []*resource.Info) (eagerResources, error) {
+	er := eagerResources{}
+	er.lookup = make(map[resourceType][]byte)
+	for _, info := range infos {
+		rt, err := getResourceTypeForInfo(info)
+		if err != nil {
+			return er, err
+		}
+		anno, err := kubectl.GetOriginalConfiguration(info.Mapping, info.Object)
+		if err != nil {
+			return er, err
+		}
+		er.lookup[rt] = anno
+	}
+	return er, nil
+}
+
+// getAnnotationForResource returns the annotation by looking up the map built earlier.
+func (er eagerResources) getAnnotationForResource(info *resource.Info) ([]byte, error) {
+	rt, err := getResourceTypeForInfo(info)
+	if err != nil {
+		return nil, err
+	}
+	return er.lookup[rt], nil
+}
+
+// getResourceTypeForInfo constructs a resourceType from info
+func getResourceTypeForInfo(info *resource.Info) (resourceType, error) {
+	accessor := info.Mapping.MetadataAccessor
+	apiVersion, err := accessor.APIVersion(info.Object)
+	if err != nil {
+		return resourceType{}, err
+	}
+	kind, err := accessor.Kind(info.Object)
+	if err != nil {
+		return resourceType{}, err
+	}
+	name, err := accessor.Name(info.Object)
+	if err != nil {
+		return resourceType{}, err
+	}
+	return resourceType{
+		ApiVersion: apiVersion,
+		Kind:       kind,
+		Name:       name,
+	}, nil
 }
