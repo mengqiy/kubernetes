@@ -23,7 +23,7 @@ import (
 
 var ErrBadJSONDoc = errors.New("Invalid JSON document")
 var ErrNoListOfLists = errors.New("Lists of lists are not supported")
-var ErrBadPatchFormatForPrimitiveList = errors.New("Invalid patch format of primitive list")
+var ErrBadPatchFormatForParallelList = errors.New("Invalid patch format of primitive list")
 
 // IsPreconditionFailed returns true if the provided error indicates
 // a precondition failed.
