@@ -485,7 +485,12 @@ func diffLists(original, modified []interface{}, t reflect.Type, mergeKey string
 	kind := elementType.Kind()
 	switch kind {
 	case reflect.Map:
-		if diffOptions.SetElementOrder {
+		patchList, deleteList, err = diffListsOfMaps(original, modified, t, mergeKey, diffOptions)
+		patchList, err = sortSliceByOneOrder(patchList, modified, mergeKey, kind)
+		// append the deletions to the end of the patch list.
+		patchList = append(patchList, deleteList...)
+		deleteList = nil
+		if diffOptions.SetElementOrder && len(patchList) > 0 {
 			// Generate a list of maps that each item contains only the merge key.
 			setOrderList = make([]interface{}, len(modified))
 			for i, v := range modified {
@@ -495,20 +500,15 @@ func diffLists(original, modified []interface{}, t reflect.Type, mergeKey string
 				}
 			}
 		}
-		patchList, deleteList, err = diffListsOfMaps(original, modified, t, mergeKey, diffOptions)
-		patchList, err = sortSliceByOneOrder(patchList, modified, mergeKey, kind)
-		// append the deletions to the end of the patch list.
-		patchList = append(patchList, deleteList...)
-		deleteList = nil
 	case reflect.Slice:
 		// Lists of Lists are not permitted by the api
 		return nil, nil, nil, mergepatch.ErrNoListOfLists
 	default:
-		if diffOptions.SetElementOrder {
-			setOrderList = modified
-		}
 		patchList, deleteList, err = diffListsOfScalars(original, modified, diffOptions)
 		patchList, err = sortSliceByOneOrder(patchList, modified, mergeKey, kind)
+		if diffOptions.SetElementOrder && (len(patchList) > 0 || len(deleteList) > 0) {
+			setOrderList = modified
+		}
 	}
 	return patchList, deleteList, setOrderList, err
 }

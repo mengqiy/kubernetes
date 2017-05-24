@@ -1411,11 +1411,7 @@ mergingList:
     value: 2
     other: b
 `),
-			ThreeWay: []byte(`
-$setElementOrder/mergingList:
-  - name: 1
-  - name: 2
-`),
+			ThreeWay: []byte(`{}`),
 			Result: []byte(`
 mergingList:
   - name: 1
@@ -4320,10 +4316,6 @@ replacingItem:
   The: RawExtension
 `),
 			ThreeWay: []byte(`
-$setElementOrder/merginglist:
-  - name: 1
-  - name: 2
-  - name: 3
 replacingItem:
   Newly: Modified
   Yaml: Inside
