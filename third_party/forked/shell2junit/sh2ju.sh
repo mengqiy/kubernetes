@@ -174,4 +174,7 @@ EOF
 EOF
   fi
 
+  if [[ $errors -gt 0 ]]; then
+    return 1
+  fi
 }
