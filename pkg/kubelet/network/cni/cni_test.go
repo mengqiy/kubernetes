@@ -43,7 +43,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/network/cni/testing"
 	"k8s.io/kubernetes/pkg/kubelet/network/hostport"
 	networktest "k8s.io/kubernetes/pkg/kubelet/network/testing"
-	utilexec "k8s.io/kubernetes/pkg/util/exec"
+	utilexec "k8s.io/utils/exec/testing"
 )
 
 func installPluginUnderTest(t *testing.T, testVendorCNIDirPrefix, testNetworkConfigPath, vendorName string, plugName string) {

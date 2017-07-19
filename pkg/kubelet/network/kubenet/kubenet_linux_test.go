@@ -32,7 +32,7 @@ import (
 	hostporttest "k8s.io/kubernetes/pkg/kubelet/network/hostport/testing"
 	nettest "k8s.io/kubernetes/pkg/kubelet/network/testing"
 	"k8s.io/kubernetes/pkg/util/bandwidth"
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/utils/exec/testing"
 	ipttest "k8s.io/kubernetes/pkg/util/iptables/testing"
 	sysctltest "k8s.io/kubernetes/pkg/util/sysctl/testing"
 )

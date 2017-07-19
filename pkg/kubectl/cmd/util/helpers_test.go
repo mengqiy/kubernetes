@@ -35,7 +35,7 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/testapi"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
-	uexec "k8s.io/kubernetes/pkg/util/exec"
+	uexec "k8s.io/utils/exec/testing"
 )
 
 func TestMerge(t *testing.T) {

@@ -26,7 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/util/dbus"
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/utils/exec/testing"
 )
 
 const TestLockfilePath = "xtables.lock"
