@@ -153,10 +153,6 @@ func CreateTwoWayMergeMapPatch(original, modified JSONMap, dataStruct interface{
 // - Build $retainKeys directive for fields with retainKeys patch strategy
 func diffMaps(original, modified map[string]interface{}, t reflect.Type, diffOptions DiffOptions) (map[string]interface{}, error) {
 	patch := map[string]interface{}{}
-	// Get the underlying type for pointers
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
 	// This will be used to build the $retainKeys directive sent in the patch
 	retainKeysList := make([]interface{}, 0, len(modified))
 
@@ -309,7 +305,7 @@ func handleSliceDiff(key string, originalValue, modifiedValue []interface{}, pat
 	// Merge the 2 slices using mergePatchKey
 	case mergeDirective:
 		diffOptions.BuildRetainKeysDirective = retainKeys
-		addList, deletionList, setOrderList, err := diffLists(originalValue, modifiedValue, fieldType.Elem(), fieldPatchMergeKey, diffOptions)
+		addList, deletionList, setOrderList, err := diffLists(originalValue, modifiedValue, fieldType, fieldPatchMergeKey, diffOptions)
 		if err != nil {
 			return err
 		}
@@ -1283,11 +1279,6 @@ func mergeMap(original, patch map[string]interface{}, t reflect.Type, mergeOptio
 			continue
 		}
 
-		// If the data type is a pointer, resolve the element.
-		if t.Kind() == reflect.Ptr {
-			t = t.Elem()
-		}
-
 		originalType := reflect.TypeOf(original[k])
 		patchType := reflect.TypeOf(patchV)
 		if originalType != patchType {
@@ -1347,8 +1338,7 @@ func mergeSliceHandler(original, patch interface{}, fieldType reflect.Type,
 	}
 
 	if fieldPatchStrategy == mergeDirective {
-		elemType := fieldType.Elem()
-		return mergeSlice(typedOriginal, typedPatch, elemType, fieldPatchMergeKey, mergeOptions, isDeleteList)
+		return mergeSlice(typedOriginal, typedPatch, fieldType, fieldPatchMergeKey, mergeOptions, isDeleteList)
 	} else {
 		return typedPatch, nil
 	}
@@ -1592,7 +1582,7 @@ func sortMergeListsByNameMap(s map[string]interface{}, t reflect.Type) (map[stri
 			} else if typedV, ok := v.([]interface{}); ok {
 				if patchStrategy == mergeDirective {
 					var err error
-					v, err = sortMergeListsByNameArray(typedV, fieldType.Elem(), fieldPatchMergeKey, true)
+					v, err = sortMergeListsByNameArray(typedV, fieldType, fieldPatchMergeKey, true)
 					if err != nil {
 						return nil, err
 					}
@@ -1868,7 +1858,6 @@ func slicesHaveConflicts(
 		return true, err
 	}
 
-	valueType := fieldType.Elem()
 	if fieldPatchStrategy == mergeDirective {
 		// Merging lists of scalars have no conflicts by definition
 		// So we only need to check further if the elements are maps
@@ -1887,7 +1876,7 @@ func slicesHaveConflicts(
 			return true, err
 		}
 
-		return mapsOfMapsHaveConflicts(leftMap, rightMap, valueType)
+		return mapsOfMapsHaveConflicts(leftMap, rightMap, fieldType)
 	}
 
 	// Either we don't have type information, or these are non-merging lists
@@ -1905,7 +1894,7 @@ func slicesHaveConflicts(
 	// Compare the slices element by element in order
 	// This test will fail if the slices are not sorted
 	for i := range typedLeft {
-		if hasConflicts, err := mergingMapFieldsHaveConflicts(typedLeft[i], typedRight[i], valueType, "", ""); hasConflicts {
+		if hasConflicts, err := mergingMapFieldsHaveConflicts(typedLeft[i], typedRight[i], fieldType, "", ""); hasConflicts {
 			return true, err
 		}
 	}
