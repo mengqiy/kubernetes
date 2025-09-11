@@ -220,20 +220,26 @@ func RegisterMetrics() {
 
 // RecordKeyID records total count and last time in seconds when a KeyID was used for TransformFromStorage and TransformToStorage operations
 func RecordKeyID(transformationType, providerName, keyID, apiServerID string) {
-	lockRecordKeyID.Lock()
-	defer lockRecordKeyID.Unlock()
+	var keyIDHash, apiServerIDHash string
+	func() {
+		lockRecordKeyID.Lock()
+		defer lockRecordKeyID.Unlock()
+		keyIDHash, apiServerIDHash = addLabelToCache(keyIDHashTotalMetricLabels, transformationType, providerName, keyID, apiServerID)
+	}()
 
-	keyIDHash, apiServerIDHash := addLabelToCache(keyIDHashTotalMetricLabels, transformationType, providerName, keyID, apiServerID)
 	KeyIDHashTotal.WithLabelValues(transformationType, providerName, keyIDHash, apiServerIDHash).Inc()
 	KeyIDHashLastTimestampSeconds.WithLabelValues(transformationType, providerName, keyIDHash, apiServerIDHash).SetToCurrentTime()
 }
 
 // RecordKeyIDFromStatus records last time in seconds when a KeyID was returned by the Status RPC call.
 func RecordKeyIDFromStatus(providerName, keyID, apiServerID string) {
-	lockRecordKeyIDStatus.Lock()
-	defer lockRecordKeyIDStatus.Unlock()
+	var keyIDHash, apiServerIDHash string
+	func() {
+		lockRecordKeyIDStatus.Lock()
+		defer lockRecordKeyIDStatus.Unlock()
+		keyIDHash, apiServerIDHash = addLabelToCache(keyIDHashStatusLastTimestampSecondsMetricLabels, "", providerName, keyID, apiServerID)
+	}()
 
-	keyIDHash, apiServerIDHash := addLabelToCache(keyIDHashStatusLastTimestampSecondsMetricLabels, "", providerName, keyID, apiServerID)
 	KeyIDHashStatusLastTimestampSeconds.WithLabelValues(providerName, keyIDHash, apiServerIDHash).SetToCurrentTime()
 }
 
