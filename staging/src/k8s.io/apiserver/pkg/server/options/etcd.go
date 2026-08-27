@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	genericfeatures "k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/server"
@@ -44,6 +45,7 @@ import (
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	storagefactory "k8s.io/apiserver/pkg/storage/storagebackend/factory"
 	storagevalue "k8s.io/apiserver/pkg/storage/value"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 )
 
@@ -118,6 +120,32 @@ func (s *EtcdOptions) Validate() []error {
 		allErrors = append(allErrors, fmt.Errorf("--storage-media-type %q invalid, allowed values: %s", s.DefaultStorageMediaType, strings.Join(sets.List(storageMediaTypes), ", ")))
 	}
 
+	allErrors = append(allErrors, s.validateStorageCompression()...)
+
+	return allErrors
+}
+
+// validateStorageCompression checks --storage-compression-config. Failing startup
+// here is deliberate, and matches the fail-closed posture of an invalid encryption
+// config: silently ignoring the file would leave an operator believing their etcd
+// is being compressed when it is not.
+//
+// The file is loaded here so that a malformed configuration is reported at startup
+// rather than when the first store is constructed. The loader caches by path, so
+// the storage layer does not pay for this a second time.
+func (s *EtcdOptions) validateStorageCompression() []error {
+	if len(s.StorageConfig.StorageCompressionConfigFile) == 0 {
+		return nil
+	}
+
+	var allErrors []error
+	if !utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageObjectCompression) {
+		allErrors = append(allErrors, fmt.Errorf("--storage-compression-config requires --feature-gates=%s=true", genericfeatures.StorageObjectCompression))
+	}
+
+	if _, err := storagefactory.LoadStorageCompressionPolicy(s.StorageConfig.StorageCompressionConfigFile); err != nil {
+		allErrors = append(allErrors, fmt.Errorf("--storage-compression-config: %w", err))
+	}
 	return allErrors
 }
 
@@ -206,6 +234,17 @@ func (s *EtcdOptions) AddFlags(fs *pflag.FlagSet) {
 
 	fs.Int64Var(&s.StorageConfig.LeaseManagerConfig.ReuseDurationSeconds, "lease-reuse-duration-seconds", s.StorageConfig.LeaseManagerConfig.ReuseDurationSeconds,
 		"The time in seconds that each lease is reused. A lower value could avoid large number of objects reusing the same lease. Notice that a too small value may cause performance problems at storage layer.")
+
+	fs.StringVar(&s.StorageConfig.StorageCompressionConfigFile, "storage-compression-config", s.StorageConfig.StorageCompressionConfigFile, ""+
+		"Path to a StorageCompressionConfiguration file selecting which resources have their serialized form compressed "+
+		"before being encrypted and written to etcd. Resource lists are evaluated in order and the first entry matching a "+
+		"resource wins, so an earlier entry with algorithm None excludes a resource from a wildcard in a later entry. "+
+		"The \"secrets\" resource is never selected by a wildcard and must be named explicitly. "+
+		"Unset (the default) means no resource is compressed on write. "+
+		"Requires --feature-gates=StorageObjectCompression=true. "+
+		"Decompression of already-persisted values is unconditional and is not affected by this file, so removing a resource "+
+		"from it never makes data unreadable. Note that adding a resource marks its existing objects stale, so they are "+
+		"rewritten by the next update or by a storage version migration.")
 }
 
 // ApplyTo mutates the provided server.Config.  It must never mutate the receiver (EtcdOptions).

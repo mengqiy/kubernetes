@@ -41,3 +41,13 @@ func SetDefaults_WebhookConfiguration(obj *WebhookConfiguration) {
 		obj.CacheUnauthorizedRequests = ptr.To(true)
 	}
 }
+
+// SetDefaults_StorageCompressionResourceConfiguration defaults the algorithm to
+// Deflate. An entry names resources in order to compress them, so Deflate is the
+// intent-preserving default; None exists to be stated explicitly, as the way to
+// exclude a resource from a wildcard in a later entry.
+func SetDefaults_StorageCompressionResourceConfiguration(obj *StorageCompressionResourceConfiguration) {
+	if len(obj.Algorithm) == 0 {
+		obj.Algorithm = CompressionAlgorithmDeflate
+	}
+}

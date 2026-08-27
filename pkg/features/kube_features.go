@@ -2327,6 +2327,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.34"), Default: true, PreRelease: featuregate.Beta},
 	},
 
+	genericfeatures.StorageObjectCompression: {
+		{Version: version.MustParse("1.38"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
 	genericfeatures.StorageVersionAPI: {
 		{Version: version.MustParse("1.20"), Default: false, PreRelease: featuregate.Alpha},
 	},
@@ -2833,6 +2837,8 @@ var defaultKubernetesFeatureGateDependencies = map[featuregate.Feature][]feature
 	genericfeatures.ShardedListAndWatch: {},
 
 	genericfeatures.SizeBasedListCostEstimate: {},
+
+	genericfeatures.StorageObjectCompression: {},
 
 	genericfeatures.StorageVersionAPI: {genericfeatures.APIServerIdentity},
 

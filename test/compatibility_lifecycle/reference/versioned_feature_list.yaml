@@ -1932,6 +1932,12 @@
     lockToDefault: false
     preRelease: Deprecated
     version: "1.33"
+- name: StorageObjectCompression
+  versionedSpecs:
+  - default: false
+    lockToDefault: false
+    preRelease: Alpha
+    version: "1.38"
 - name: StorageVersionAPI
   versionedSpecs:
   - default: false

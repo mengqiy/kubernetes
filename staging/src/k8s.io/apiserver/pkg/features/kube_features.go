@@ -248,6 +248,20 @@ const (
 	// Enables APF to use size of objects for estimating request cost.
 	SizeBasedListCostEstimate featuregate.Feature = "SizeBasedListCostEstimate"
 
+	// owner: @sig-api-machinery @sig-auth
+	// kep: https://kep.k8s.io/6264
+	//
+	// Enables compressing the serialized form of an API object before it is
+	// encrypted and written to etcd. Compression must precede encryption
+	// because ciphertext is incompressible.
+	//
+	// DECOMPRESSION OF ALREADY-PERSISTED VALUES IS UNCONDITIONAL AND IS NOT
+	// CONTROLLED BY THIS GATE: this gate governs the write path only, so that
+	// disabling it can never make persisted data unreadable. Enabling the gate
+	// on its own compresses nothing; --storage-compression-config must also name at
+	// least one resource.
+	StorageObjectCompression featuregate.Feature = "StorageObjectCompression"
+
 	// owner: @caesarxuchao @roycaihw
 	//
 	// Enable the storage version API.
@@ -472,6 +486,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 
 	SizeBasedListCostEstimate: {
 		{Version: version.MustParse("1.34"), Default: true, PreRelease: featuregate.Beta},
+	},
+
+	StorageObjectCompression: {
+		{Version: version.MustParse("1.38"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	StorageVersionAPI: {

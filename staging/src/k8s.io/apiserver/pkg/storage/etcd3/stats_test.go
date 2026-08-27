@@ -34,7 +34,7 @@ func TestStatsCachePrefix(t *testing.T) {
 				t.Run(key, func(t *testing.T) {
 					estimator := newResourceSizeEstimator(prefix, func(context.Context) ([]string, error) {
 						return []string{key}, nil
-					})
+					}, nil)
 					t.Cleanup(estimator.Close)
 					estimator.UpdateKey(&mvccpb.KeyValue{Key: []byte(storageKey), Value: []byte("abc"), ModRevision: 1})
 
@@ -51,7 +51,7 @@ func TestStatsCachePrefix(t *testing.T) {
 
 func TestStatsCache(t *testing.T) {
 	ctx := t.Context()
-	store := newResourceSizeEstimator("/prefix", func(ctx context.Context) ([]string, error) { return []string{}, nil })
+	store := newResourceSizeEstimator("/prefix", func(ctx context.Context) ([]string, error) { return []string{}, nil }, nil)
 	defer store.Close()
 
 	stats, err := store.Stats(ctx)

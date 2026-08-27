@@ -74,6 +74,23 @@ type Config struct {
 	// Transformer allows the value to be transformed prior to persisting into etcd.
 	Transformer value.Transformer
 
+	// StorageCompressionConfigFile is the path to a
+	// StorageCompressionConfiguration selecting which resources have their
+	// serialized form compressed before Transformer encrypts them, from
+	// --storage-compression-config.
+	//
+	// This is deliberately the path rather than a resolved policy: Config is
+	// copied by value into every StorageFactory and every ConfigForResource, and
+	// several consumers copy it without going through EtcdOptions.ApplyTo at all
+	// (NewCRDRESTOptionsGetter is the important one, since custom resources are
+	// the largest beneficiary). A plain string therefore reaches every store,
+	// while the file itself is read once per process by the factory.
+	//
+	// This only ever affects the write path. Decompression is format-driven and
+	// unconditional, so a value compressed by any apiserver stays readable
+	// whatever this is set to.
+	StorageCompressionConfigFile string
+
 	// CompactionInterval is an interval of requesting compaction from apiserver.
 	// If the value is 0, no compaction will be issued.
 	CompactionInterval time.Duration

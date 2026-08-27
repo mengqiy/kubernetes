@@ -48,6 +48,7 @@ import (
 	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
 	etcdfeature "k8s.io/apiserver/pkg/storage/feature"
 	"k8s.io/apiserver/pkg/storage/value"
+	"k8s.io/apiserver/pkg/storage/value/compression"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/tracing"
 	"k8s.io/klog/v2"
@@ -700,7 +701,7 @@ func (s *store) EnableResourceSizeEstimation(getKeys storage.KeysFunc) error {
 	if s.resourceSizeEstimator != nil {
 		return errors.New("resourceSizeEstimator already enabled")
 	}
-	s.resourceSizeEstimator = newResourceSizeEstimator(s.pathPrefix, getKeys)
+	s.resourceSizeEstimator = newResourceSizeEstimator(s.pathPrefix, getKeys, s.plaintextExpansionFactor)
 	return nil
 }
 
@@ -717,6 +718,18 @@ func TestOnlyResetResourceSizeEstimator(s storage.Interface) {
 		st.resourceSizeEstimator.Close()
 		st.resourceSizeEstimator = nil
 	}
+}
+
+// plaintextExpansionFactor reports how much larger the plaintext of this
+// resource's values is than the bytes stored in etcd, so that the size estimate
+// -- and therefore APF's LIST memory accounting -- reflects the decompressed size
+// rather than the compressed one. It is 1.0 unless storage compression is
+// installed and has actually observed compressed values.
+func (s *store) plaintextExpansionFactor() float64 {
+	if expander, ok := s.transformer.(compression.PlaintextSizeExpander); ok {
+		return expander.ExpansionFactor()
+	}
+	return 1
 }
 
 func (s *store) getKeys(ctx context.Context) ([]string, error) {
@@ -1223,6 +1236,23 @@ func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, rev int64, ke
 
 	data, stale, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(key))
 	if err != nil {
+		// A storage compression frame this apiserver cannot interpret means
+		// version skew or a misconfiguration, not corruption: the bytes may be
+		// perfectly good, and a newer apiserver would read them. Refuse the read
+		// regardless of expectTransformOrDecodeError, so that such an object can
+		// never become eligible for unsafe deletion.
+		//
+		// This check has to live here rather than in
+		// corruptObjErrorInterpretingTransformer, because the unsafe-delete path
+		// never consults corruptObjectError: it arrives with
+		// expectTransformOrDecodeError set and the branch below treats *any*
+		// transform error as license to delete. Classification alone would only
+		// remove the invitation, not the capability.
+		if errors.Is(err, compression.ErrUnsupportedCompressionAlgorithm) ||
+			errors.Is(err, compression.ErrCompressionFormat) {
+			return nil, storage.NewInternalError(err)
+		}
+
 		if !expectTransformOrDecodeError {
 			return nil, storage.NewInternalError(err)
 		}

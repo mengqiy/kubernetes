@@ -51,6 +51,7 @@ import (
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
+	"k8s.io/apiserver/pkg/storage/value/compression"
 	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/metrics/legacyregistry"
@@ -471,6 +472,33 @@ func newETCD3Storage(c storagebackend.ConfigForResource, newFunc, newListFunc fu
 	if transformer == nil {
 		transformer = identity.NewEncryptCheckTransformer()
 	}
+
+	// Compression sits between the store and the encryption chain. Because a
+	// decorator's TransformToStorage compresses and *then* delegates, the
+	// effective ordering is compress -> encrypt -> prefix, which is the only
+	// ordering that yields a useful ratio: ciphertext is incompressible. On read
+	// the encryption transformer decrypts first and this layer unframes.
+	//
+	// The decorator is installed UNCONDITIONALLY, whatever the policy or the
+	// feature gate say. Read support must never depend on configuration: a value
+	// framed by any apiserver has to be readable by every apiserver of this
+	// version or newer with any flags, or else dropping a flag would strand
+	// data. Default inertness is preserved because the policy is consulted
+	// inside TransformToStorage, and unframe returns non-framed bytes verbatim.
+	// The configuration file is read and validated once per process, cached by
+	// path, so this is a map lookup for all but the first resource. The feature
+	// gate is consulted here rather than at load time so that turning the gate off
+	// makes the write path inert without requiring the configuration to be removed.
+	var compressionPolicy *compression.Policy
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageObjectCompression) {
+		var err error
+		if compressionPolicy, err = LoadStorageCompressionPolicy(c.StorageCompressionConfigFile); err != nil {
+			stopCompactor()
+			_ = client.Close()
+			return nil, nil, err
+		}
+	}
+	transformer = compression.WithCompression(transformer, compressionPolicy, c.GroupResource)
 
 	versioner := storage.APIObjectVersioner{}
 	decoder := etcd3.NewDefaultDecoder(c.Codec, versioner)

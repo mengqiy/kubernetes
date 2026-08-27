@@ -30,6 +30,7 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/value"
+	"k8s.io/apiserver/pkg/storage/value/compression"
 	"k8s.io/klog/v2"
 )
 
@@ -184,14 +185,53 @@ type corruptObjErrorInterpretingTransformer struct {
 	value.Transformer
 }
 
+// ExpansionFactor forwards to the wrapped transformer if it estimates plaintext
+// expansion. Embedding value.Transformer only promotes that interface's methods,
+// so without this explicit forward a type assertion for
+// compression.PlaintextSizeExpander would fail whenever this wrapper is installed,
+// and the resource size estimator would silently lose its correction.
+func (t *corruptObjErrorInterpretingTransformer) ExpansionFactor() float64 {
+	if expander, ok := t.Transformer.(compression.PlaintextSizeExpander); ok {
+		return expander.ExpansionFactor()
+	}
+	return 1
+}
+
 func (t *corruptObjErrorInterpretingTransformer) TransformFromStorage(ctx context.Context, data []byte, dataCtx value.Context) ([]byte, bool, error) {
 	// TODO: right now any error is deemed as undecodable, in the future, we
 	// can apply some filter, if need be. For example, any network error
 	out, stale, err := t.Transformer.TransformFromStorage(ctx, data, dataCtx)
-	if err != nil {
+	if err != nil && !isRecoverableStorageFormatError(err) {
 		err = &corruptObjectError{err: err, errType: untransformable}
 	}
 	return out, stale, err
+}
+
+// isRecoverableStorageFormatError reports whether err means "this apiserver
+// cannot interpret the stored format" rather than "the stored bytes are
+// damaged". A storage compression frame carrying an algorithm this binary does
+// not implement was written by a newer apiserver and is perfectly readable by
+// one; a malformed frame may equally be a bug in this layer. Neither is
+// corruption of the object.
+//
+// Classifying these as corrupt objects would surface them to the client as a
+// CorruptObjError, which is exactly the signal that invites an operator to reach
+// for `kubectl delete --ignore-store-read-errors-with-cluster-breaking-potential`
+// and destroy an object that was never damaged. This removes that invitation;
+// store.getState separately refuses the read outright for these two sentinels,
+// which is what removes the capability, since the unsafe-delete path arrives with
+// expectTransformOrDecodeError set and would otherwise treat any transform error
+// as license to delete.
+//
+// Consequence to be aware of on LIST: corruptObjErrAggregator.Append treats
+// anything that is not a corruptObjectError as a reason to abort the whole list
+// rather than to aggregate per item. That is the intended trade here -- one
+// loud, immediate, unambiguous failure meaning "upgrade this apiserver" beats up
+// to maxCorruptObjErrsToAggregate partial ones -- but it is a deliberate choice
+// rather than an accident.
+func isRecoverableStorageFormatError(err error) bool {
+	return errors.Is(err, compression.ErrUnsupportedCompressionAlgorithm) ||
+		errors.Is(err, compression.ErrCompressionFormat)
 }
 
 // corruptObjectError is used internally, only by the corrupt object

@@ -33,15 +33,23 @@ import (
 
 const sizerRefreshInterval = time.Minute
 
-func newResourceSizeEstimator(prefix string, getKeys storage.KeysFunc) *resourceSizeEstimator {
+// expansionFactorFunc returns a multiplier >= 1.0 to apply to the measured stored
+// size in order to estimate the plaintext size. See resourceSizeEstimator.Stats.
+type expansionFactorFunc func() float64
+
+func newResourceSizeEstimator(prefix string, getKeys storage.KeysFunc, expansionFactor expansionFactorFunc) *resourceSizeEstimator {
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
+	if expansionFactor == nil {
+		expansionFactor = func() float64 { return 1 }
+	}
 	sc := &resourceSizeEstimator{
-		prefix:  prefix,
-		getKeys: getKeys,
-		stop:    make(chan struct{}),
-		keys:    make(map[string]sizeRevision),
+		prefix:          prefix,
+		getKeys:         getKeys,
+		expansionFactor: expansionFactor,
+		stop:            make(chan struct{}),
+		keys:            make(map[string]sizeRevision),
 	}
 	sc.wg.Add(1)
 	go func() {
@@ -63,11 +71,12 @@ func newResourceSizeEstimator(prefix string, getKeys storage.KeysFunc) *resource
 type resourceSizeEstimator struct {
 	// prefix is the backend prefix with a trailing '/' so key matching respects
 	// path boundaries. Unlike store.pathPrefix, it is '/' for the root.
-	prefix         string
-	stop           chan struct{}
-	wg             sync.WaitGroup
-	lastKeyCleanup atomic.Pointer[time.Time]
-	getKeys        storage.KeysFunc
+	prefix          string
+	stop            chan struct{}
+	wg              sync.WaitGroup
+	lastKeyCleanup  atomic.Pointer[time.Time]
+	getKeys         storage.KeysFunc
+	expansionFactor expansionFactorFunc
 
 	keysLock sync.Mutex
 	keys     map[string]sizeRevision
@@ -90,7 +99,19 @@ func (sc *resourceSizeEstimator) Stats(ctx context.Context) (storage.Stats, erro
 	defer sc.keysLock.Unlock()
 	sc.cleanKeys(keys)
 	if len(sc.keys) != 0 {
-		stats.EstimatedAverageObjectSizeBytes = sc.keySizes() / int64(len(sc.keys))
+		averageStoredBytes := sc.keySizes() / int64(len(sc.keys))
+		// The per-key sizes recorded here are len(kv.Value), i.e. the stored size.
+		// When storage compression is in use that is smaller than the plaintext,
+		// but consumers of this estimate -- notably API Priority and Fairness,
+		// which uses it to bound the memory a LIST will occupy -- care about the
+		// decompressed, decoded size. Scale by the observed expansion so that
+		// compression cannot cause APF to admit more concurrent LISTs than the
+		// apiserver can hold in memory. The factor is >= 1.0, so this can only
+		// ever be more conservative than the raw measurement.
+		if factor := sc.expansionFactor(); factor > 1 {
+			averageStoredBytes = int64(float64(averageStoredBytes) * factor)
+		}
+		stats.EstimatedAverageObjectSizeBytes = averageStoredBytes
 	}
 	return stats, nil
 }
