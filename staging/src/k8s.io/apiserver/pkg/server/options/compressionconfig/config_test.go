@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +30,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	apiserverv1alpha1 "k8s.io/apiserver/pkg/apis/apiserver/v1alpha1"
 	"k8s.io/apiserver/pkg/storage/value"
 	"k8s.io/apiserver/pkg/storage/value/compression"
@@ -179,7 +181,7 @@ func TestLoadCompressionConfigRejects(t *testing.T) {
 		{
 			name:    "a minSize below the floor",
 			content: strings.Replace(validConfig, "minSize: 2Ki", "minSize: 63", 1),
-			wantErr: `resources[1].minSize: Invalid value: "63": must be at least 64`,
+			wantErr: `resources[1].minSize: Invalid value: "63": must be greater than or equal to 64`,
 		},
 		{
 			name:    "a masked selector",
@@ -200,6 +202,51 @@ func TestLoadCompressionConfigRejects(t *testing.T) {
 				t.Errorf("LoadCompressionConfig() returned %+v with its error, want nil", c)
 			}
 		})
+	}
+}
+
+// TestLoadCompressionConfigReportsEachErrorOnce checks that one error lists what
+// the generated rules and the custom ones found, and that neither rewords what
+// the other reported. ToAggregate drops identical messages, so the v1alpha1
+// test is what catches an exact repeat.
+func TestLoadCompressionConfigReportsEachErrorOnce(t *testing.T) {
+	content := `
+apiVersion: apiserver.config.k8s.io/v1alpha1
+kind: StorageCompressionConfiguration
+resources:
+- resources: []
+  algorithm: Deflate
+- resources: ["configmaps"]
+- resources: ["pods", "pods"]
+  algorithm: Zstd
+  minSize: 63
+- resources: ["*.*"]
+  algorithm: Deflate
+  minSize: 1472Ki
+- resources: ["services"]
+  algorithm: None
+`
+	_, err := LoadCompressionConfig(writeConfig(t, content))
+	var agg utilerrors.Aggregate
+	if !errors.As(err, &agg) {
+		t.Fatalf("LoadCompressionConfig() = %v, want an aggregate of validation errors", err)
+	}
+	want := []string{
+		"resources[0].resources: Required value",
+		"resources[1].algorithm: Required value",
+		`resources[2].resources[1]: Duplicate value: "pods"`,
+		`resources[2].algorithm: Unsupported value: "Zstd"`,
+		`resources[2].minSize: Invalid value: "63"`,
+		`resources[3].minSize: Invalid value: "1472Ki"`,
+		`resources[4].resources[0]: Invalid value: "services": masked by resources[3].resources[0]`,
+	}
+	if len(agg.Errors()) != len(want) {
+		t.Errorf("got %d errors, want %d: %v", len(agg.Errors()), len(want), err)
+	}
+	for _, w := range want {
+		if n := strings.Count(err.Error(), w); n != 1 {
+			t.Errorf("%q appears %d times, want once: %v", w, n, err)
+		}
 	}
 }
 
@@ -496,8 +543,8 @@ func TestRuleForFollowsFirstMatch(t *testing.T) {
 }
 
 // TestNewCompressionConfigurationValidates checks that the only constructor
-// rejects what validation rejects, so no CompressionConfiguration holds rules
-// from an invalid file.
+// runs the generated rules and the custom ones, so no CompressionConfiguration
+// holds rules from an invalid file.
 func TestNewCompressionConfigurationValidates(t *testing.T) {
 	for name, config := range map[string]*apiserverv1alpha1.StorageCompressionConfiguration{
 		"nil":                       nil,

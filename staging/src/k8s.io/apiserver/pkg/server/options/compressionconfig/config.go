@@ -19,11 +19,13 @@ limitations under the License.
 package compressionconfig
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
 
+	"k8s.io/apimachinery/pkg/api/operation"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -94,7 +96,7 @@ func newCompressionConfiguration(versioned *apiserverv1alpha1.StorageCompression
 	if versioned == nil {
 		return nil, errors.New("StorageCompressionConfiguration can't be nil")
 	}
-	if err := apiserverv1alpha1.ValidateStorageCompressionConfiguration(versioned).ToAggregate(); err != nil {
+	if err := apiserverv1alpha1.Validate_StorageCompressionConfiguration(context.Background(), operation.Operation{Type: operation.Create}, nil, versioned, nil).ToAggregate(); err != nil {
 		return nil, err
 	}
 	config := &apiserver.StorageCompressionConfiguration{}

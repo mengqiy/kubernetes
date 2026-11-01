@@ -17,8 +17,10 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/operation"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -37,9 +39,11 @@ func minSizeEntry(resource, minSize string) CompressionResourceConfiguration {
 	return e
 }
 
-// TestValidateStorageCompressionConfiguration matches errors by type, field and
-// origin, so it doesn't pin message wording. A masking error's detail must name
-// the path of the selector that masks it.
+// TestValidateStorageCompressionConfiguration covers the generated rules and the
+// custom ones together, matching errors by type, field and origin. A masking
+// error's detail must name the selector that masks it. The floor cases pin
+// +k8s:minimum=64: DEFLATE almost never shrinks a smaller value, which then
+// costs a 9-byte verbatim frame and the CPU spent trying.
 func TestValidateStorageCompressionConfiguration(t *testing.T) {
 	root := field.NewPath("resources")
 	resources := root.Index(0).Child("resources")
@@ -52,9 +56,6 @@ func TestValidateStorageCompressionConfiguration(t *testing.T) {
 		in   *StorageCompressionConfiguration
 		want field.ErrorList
 	}{{
-		desc: "nil config",
-		want: field.ErrorList{field.Required(root, "")},
-	}, {
 		desc: "no entries compress nothing",
 		in:   compressionConfig(),
 	}, {
@@ -139,13 +140,20 @@ func TestValidateStorageCompressionConfiguration(t *testing.T) {
 		in:   compressionConfig(CompressionResourceConfiguration{Resources: []string{"configmaps"}}),
 		want: field.ErrorList{field.Required(root.Index(0).Child("algorithm"), "")},
 	}, {
-		desc: "an unknown algorithm",
-		in:   compressionConfig(CompressionResourceConfiguration{Resources: []string{"configmaps"}, Algorithm: "Zstd"}),
-		want: field.ErrorList{field.NotSupported[CompressionAlgorithm](root.Index(0).Child("algorithm"), nil, nil)},
+		desc: "an unknown algorithm, including a known one in another case",
+		in: compressionConfig(
+			CompressionResourceConfiguration{Resources: []string{"configmaps"}, Algorithm: "Zstd"},
+			CompressionResourceConfiguration{Resources: []string{"pods"}, Algorithm: "deflate"},
+		),
+		want: field.ErrorList{
+			field.NotSupported[CompressionAlgorithm](root.Index(0).Child("algorithm"), nil, nil),
+			field.NotSupported[CompressionAlgorithm](root.Index(1).Child("algorithm"), nil, nil),
+		},
 	}, {
 		desc: "minSize at both ends of its range",
 		in: compressionConfig(
 			minSizeEntry("configmaps", "64"),
+			minSizeEntry("secrets", "64.0"),
 			minSizeEntry("pods", "1471Ki"),
 			minSizeEntry("services", "1507327"),
 		),
@@ -159,15 +167,22 @@ func TestValidateStorageCompressionConfiguration(t *testing.T) {
 			minSizeEntry("leases.coordination.k8s.io", "1e30"),
 			minSizeEntry("widgets.example.com", "100.5"),
 			minSizeEntry("gadgets.example.com", "0.1Ki"),
+			minSizeEntry("endpoints", "63.999"),
+			minSizeEntry("events", "-1e30"),
 		),
 		want: field.ErrorList{
 			field.Invalid(minSize(0), nil, "").WithOrigin("minimum"),
 			field.Invalid(minSize(1), nil, "").WithOrigin("maximum"),
+			// 512m is below the floor and fractional, and each rule reports it.
 			field.Invalid(minSize(2), nil, "").WithOrigin("minimum"),
+			field.Invalid(minSize(2), nil, "").WithOrigin("wholeNumber"),
 			field.Invalid(minSize(3), nil, "").WithOrigin("minimum"),
 			field.Invalid(minSize(4), nil, "").WithOrigin("maximum"),
 			field.Invalid(minSize(5), nil, "").WithOrigin("wholeNumber"),
 			field.Invalid(minSize(6), nil, "").WithOrigin("wholeNumber"),
+			field.Invalid(minSize(7), nil, "").WithOrigin("minimum"),
+			field.Invalid(minSize(7), nil, "").WithOrigin("wholeNumber"),
+			field.Invalid(minSize(8), nil, "").WithOrigin("minimum"),
 		},
 	}, {
 		desc: "every selector an earlier entry masks, reported together",
@@ -240,7 +255,7 @@ func TestValidateStorageCompressionConfiguration(t *testing.T) {
 		),
 	}} {
 		t.Run(tc.desc, func(t *testing.T) {
-			matcher.Test(t, tc.want, ValidateStorageCompressionConfiguration(tc.in))
+			matcher.Test(t, tc.want, Validate_StorageCompressionConfiguration(context.Background(), operation.Operation{Type: operation.Create}, nil, tc.in, nil))
 		})
 	}
 }
