@@ -33,54 +33,39 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"k8s.io/apiserver/pkg/internal/storagecompression"
 )
 
-// Frame layout. This is the at-rest format and must never change. The 9-byte
-// header is laid out the same for every algorithm, so a reader can verify the
-// checksum even on a frame whose algorithm it doesn't support.
-//
-//	offset  size  meaning
-//	0       1     0x00, the discriminator
-//	1       3     "k8s"
-//	4       1     algorithm
-//	5       4     CRC32C, little-endian, over every frame byte except these four
-//	9       ...   body, defined by the algorithm
-//
-// The algStored (0x00) body:
-//
-//	offset  size  meaning
-//	9       n     the plaintext, verbatim; n is the frame length minus 9
-//
-// The algDeflate (0x01) body:
-//
-//	offset  size  meaning
-//	9       w     declared plaintext length n, unsigned LEB128; 1-3 bytes, as n <= MaxPlaintextBytes
-//	9+w     ...   raw DEFLATE stream (RFC 1951) that inflates to exactly n bytes and ends
+// A frame's layout is the at-rest format and must never change. The 9-byte
+// header is the same for every algorithm, so a reader can verify the checksum
+// even on a frame whose algorithm it doesn't support. TestFrameByteExact and
+// TestDecodesPinnedFrames pin the bytes.
 const (
+	// Byte 0 is the discriminator, and bytes 1-3 are "k8s".
 	frameDiscriminator byte = 0x00
 
-	// algStored marks a value kept verbatim inside a frame. That's either a value
-	// the policy selected that DEFLATE couldn't shrink, which stays framed so reads
-	// don't report it stale, or an escaped value that begins with 0x00.
-	algStored  byte = 0x00
+	// Byte 4 is the algorithm, which defines the body after the header. An
+	// algStored body is the plaintext verbatim: either a value a Rule selected
+	// that DEFLATE couldn't shrink, which stays framed so reads don't report it
+	// stale, or an escaped value that begins with 0x00.
+	algStored byte = 0x00
+	// An algDeflate body is the plaintext length n as the shortest unsigned LEB128
+	// (1-3 bytes), then a raw DEFLATE stream (RFC 1951) that inflates to exactly n
+	// bytes and ends where the frame ends.
 	algDeflate byte = 0x01
 
+	// Bytes 5-8 are a little-endian CRC32C over every other byte of the frame.
 	crcOffset  = 5
 	headerSize = 9
 
-	// DefaultMinSize is the write threshold when an entry sets none. Below it the
-	// ratio doesn't repay the CPU spent on every read and write.
-	DefaultMinSize = 1024
+	// maxDeclaredLength is the largest declared length a reader inflates. It's part
+	// of the at-rest format, so it never shrinks.
+	maxDeclaredLength = 1536*1024 - 64*1024
 
-	// MinConfigurableMinSize is the smallest legal threshold.
-	MinConfigurableMinSize = 64
-
-	// MaxPlaintextBytes is the largest value the policy frames and the largest declared
-	// length a reader inflates. etcd's default 1.5 MiB limit applies to the whole request,
-	// so 64 KiB is kept for the key, the transaction and any encryption envelope, which
-	// for KMS v2 can hold 32 KiB of annotations. Anything compressed can then be rewritten
-	// uncompressed. An escaped value is framed at any size, since it can't be stored bare.
-	MaxPlaintextBytes = 1536*1024 - 64*1024
+	// maxPlaintextBytes is the largest value a Rule frames. An escaped value is
+	// framed at any size, since it can't be stored bare.
+	maxPlaintextBytes = storagecompression.MaxPlaintextBytes
 
 	deflateLevel = 1
 
@@ -260,7 +245,8 @@ func unframe(ctx context.Context, data []byte) ([]byte, frameKind, error) {
 
 	case algDeflate:
 		n, w := binary.Uvarint(data[headerSize:])
-		if w <= 0 || n == 0 || n > MaxPlaintextBytes {
+		// A padded encoding decodes to the same n, but no writer produces one.
+		if w <= 0 || n == 0 || n > maxDeclaredLength || w != uvarintLen(n) {
 			return nil, framedDeflate, rejectFrame(errFormat, "invalid declared length")
 		}
 
@@ -283,10 +269,15 @@ func unframe(ctx context.Context, data []byte) ([]byte, frameKind, error) {
 	}
 }
 
-// inflateExact requires the stream to produce exactly n bytes and then end. It
-// reads only one byte past n, so a stream that inflates further costs at most
-// one 32 KiB inflater window instead of being drained.
-func inflateExact(src io.Reader, n int) ([]byte, error) {
+func uvarintLen(n uint64) int {
+	var buf [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(buf[:], n)
+}
+
+// inflateExact requires the stream to produce exactly n bytes and to end where
+// src ends. It reads only one byte past n, so a stream that inflates further
+// costs at most one 32 KiB inflater window instead of being drained.
+func inflateExact(src *bytes.Reader, n int) ([]byte, error) {
 	out := make([]byte, n)
 	zr := readerPool.Get().(io.ReadCloser)
 	defer readerPool.Put(zr)
@@ -306,6 +297,13 @@ func inflateExact(src io.Reader, n int) ([]byte, error) {
 		return nil, rejectFrame(errFormat, "stream longer than declared length")
 	case err != nil:
 		return nil, rejectFrame(errFormat, "stream does not end at its declared length")
+	// flate reads an io.ByteReader a byte at a time and stops at the last byte of
+	// the final block, so anything left in src was appended after the stream.
+	case src.Len() != 0:
+		return nil, rejectFrame(errFormat, "bytes after the end of the stream")
 	}
 	return out, nil
 }
+
+// The write ceiling can drop below the read cap but never rise above it.
+const _ uint = maxDeclaredLength - maxPlaintextBytes

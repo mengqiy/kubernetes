@@ -46,6 +46,8 @@ var (
 
 var registerMetrics sync.Once
 
+// RegisterMetrics is exported to match encryptionconfig/metrics.
+// RecordLastConfigInfo already calls it.
 func RegisterMetrics() {
 	registerMetrics.Do(func() {
 		legacyregistry.CustomMustRegister(configmetrics.NewConfigInfoCustomCollector(lastConfigInfo, configHashProvider))

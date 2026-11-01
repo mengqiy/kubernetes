@@ -26,7 +26,7 @@ import (
 // StorageCompressionConfiguration chooses which resources are compressed as
 // they're written to etcd, ahead of any encryption at rest. Entries are checked
 // in order and the first match wins, so a selector already covered by an earlier
-// one is rejected. Wildcards never match secrets; name secrets to compress them.
+// one is rejected. Wildcards never match core secrets; name secrets to compress them.
 type StorageCompressionConfiguration struct {
 	metav1.TypeMeta `json:""`
 
@@ -41,13 +41,15 @@ type StorageCompressionConfiguration struct {
 type CompressionResourceConfiguration struct {
 	// resources lists resources as <resource> or <resource>.<group>. '*.<group>'
 	// selects a group, '*.' the core group and '*.*' every group. No wildcard
-	// selects secrets.
+	// selects core secrets.
+	// +required
 	Resources []string `json:"resources"`
 
 	// algorithm is Deflate or None. None keeps resources out of a later wildcard.
+	// +required
 	Algorithm CompressionAlgorithm `json:"algorithm"`
 
-	// minSize is the smallest serialized value that is compressed, as a quantity
+	// minSize is the smallest serialized value that's compressed, as a quantity
 	// of bytes such as 512 or 4Ki. It defaults to 1Ki. It must be a whole number
 	// of bytes, at least 64 and less than 1472Ki, the largest value that's ever
 	// compressed.

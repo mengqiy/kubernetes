@@ -17,6 +17,8 @@ limitations under the License.
 package compressionconfig
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -27,9 +29,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apiserver/pkg/apis/apiserver"
-	"k8s.io/apiserver/pkg/apis/apiserver/validation"
+	apiserverv1alpha1 "k8s.io/apiserver/pkg/apis/apiserver/v1alpha1"
+	"k8s.io/apiserver/pkg/storage/value"
 	"k8s.io/apiserver/pkg/storage/value/compression"
+	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
 )
 
 const validConfig = `
@@ -45,7 +48,43 @@ resources:
   algorithm: Deflate
 `
 
-type entryConfig = apiserver.CompressionResourceConfiguration
+var (
+	configmaps = gr("", "configmaps")
+	pods       = gr("", "pods")
+	events     = gr("", "events")
+	// secrets is spelled out rather than taken from storagecompression, so the
+	// firstMatch oracle doesn't share code with what it checks.
+	secrets = gr("", "secrets")
+)
+
+const (
+	deflate = apiserverv1alpha1.CompressionAlgorithmDeflate
+	none    = apiserverv1alpha1.CompressionAlgorithmNone
+)
+
+type entryConfig = apiserverv1alpha1.CompressionResourceConfiguration
+
+func gr(group, resource string) schema.GroupResource {
+	return schema.GroupResource{Group: group, Resource: resource}
+}
+
+func entry(algorithm apiserverv1alpha1.CompressionAlgorithm, resources ...string) entryConfig {
+	return entryConfig{Resources: resources, Algorithm: algorithm}
+}
+
+func withMinSize(e entryConfig, minSize int64) entryConfig {
+	e.MinSize = resource.NewQuantity(minSize, resource.BinarySI)
+	return e
+}
+
+func mustConfig(t *testing.T, entries ...entryConfig) *CompressionConfiguration {
+	t.Helper()
+	c, err := newCompressionConfiguration(&apiserverv1alpha1.StorageCompressionConfiguration{Resources: entries}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
 
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
@@ -57,25 +96,25 @@ func writeConfig(t *testing.T, content string) string {
 }
 
 func TestLoadCompressionConfig(t *testing.T) {
-	policy, hash, err := LoadCompressionConfig(writeConfig(t, validConfig))
+	c, err := LoadCompressionConfig(writeConfig(t, validConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
-	configmaps, pods, events := schema.GroupResource{Resource: "configmaps"}, schema.GroupResource{Resource: "pods"}, schema.GroupResource{Resource: "events"}
-	if !policy.EnabledFor(configmaps) || !policy.EnabledFor(pods) || policy.EnabledFor(events) || policy.EnabledFor(compression.SecretsGroupResource) {
-		t.Error("the loaded policy doesn't select what the file says")
+	for gr, want := range map[schema.GroupResource]compression.Rule{
+		configmaps: {Algorithm: compression.AlgorithmDeflate, MinSize: 2048},
+		pods:       {Algorithm: compression.AlgorithmDeflate},
+		events:     {},
+		secrets:    {},
+	} {
+		if got := c.RuleFor(gr); got != want {
+			t.Errorf("RuleFor(%s) = %+v, want %+v", gr, got, want)
+		}
 	}
-	if got := policy.MinSizeFor(configmaps); got != 2048 {
-		t.Errorf("MinSizeFor(configmaps) = %d, want 2048 from 2Ki", got)
+	if want := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(validConfig))); c.CompressionFileContentHash != want {
+		t.Errorf("hash = %q, want %q", c.CompressionFileContentHash, want)
 	}
-	if got := policy.MinSizeFor(pods); got != compression.DefaultMinSize {
-		t.Errorf("MinSizeFor(pods) = %d, want the default %d when minSize is omitted", got, compression.DefaultMinSize)
-	}
-	if want := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(validConfig))); hash != want {
-		t.Errorf("hash = %q, want %q", hash, want)
-	}
-	if _, other, err := LoadCompressionConfig(writeConfig(t, validConfig+"\n")); err != nil || other == hash {
-		t.Errorf("a different file must hash differently: %q, %v", other, err)
+	if other, err := LoadCompressionConfig(writeConfig(t, validConfig+"\n")); err != nil || other.CompressionFileContentHash == c.CompressionFileContentHash {
+		t.Errorf("a different file must hash differently: %v", err)
 	}
 }
 
@@ -89,14 +128,14 @@ func TestLoadCompressionConfigSelectingNothing(t *testing.T) {
 		"no resources key": header,
 	} {
 		t.Run(name, func(t *testing.T) {
-			policy, hash, err := LoadCompressionConfig(writeConfig(t, content))
+			c, err := LoadCompressionConfig(writeConfig(t, content))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if policy.EnabledFor(schema.GroupResource{Resource: "configmaps"}) {
-				t.Error("a file with no entries must compress nothing")
+			if got := c.RuleFor(configmaps); got != (compression.Rule{}) {
+				t.Errorf("RuleFor(configmaps) = %+v, want the zero Rule", got)
 			}
-			if hash == "" {
+			if c.CompressionFileContentHash == "" {
 				t.Error("the hash must still be reported, so replicas can be compared")
 			}
 		})
@@ -138,9 +177,14 @@ func TestLoadCompressionConfigRejects(t *testing.T) {
 			wantErr: "resources[0].algorithm: Unsupported value",
 		},
 		{
+			name:    "a minSize below the floor",
+			content: strings.Replace(validConfig, "minSize: 2Ki", "minSize: 63", 1),
+			wantErr: `resources[1].minSize: Invalid value: "63": must be at least 64`,
+		},
+		{
 			name:    "a masked selector",
 			content: validConfig + "- resources: [\"pods\"]\n  algorithm: None\n",
-			wantErr: `resources[3].resources[0]: Invalid value: "pods": masked by earlier rule "*.*"`,
+			wantErr: `resources[3].resources[0]: Invalid value: "pods": masked by resources[2].resources[0]`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,9 +192,191 @@ func TestLoadCompressionConfigRejects(t *testing.T) {
 			if !tc.noFile {
 				path = writeConfig(t, tc.content)
 			}
-			_, _, err := LoadCompressionConfig(path)
+			c, err := LoadCompressionConfig(path)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), path) {
 				t.Fatalf("LoadCompressionConfig() = %v, want an error naming the file and containing %q", err, tc.wantErr)
+			}
+			if c != nil {
+				t.Errorf("LoadCompressionConfig() returned %+v with its error, want nil", c)
+			}
+		})
+	}
+}
+
+func TestRuleFor(t *testing.T) {
+	cases := []struct {
+		name     string
+		entries  []entryConfig
+		enabled  []schema.GroupResource
+		disabled []schema.GroupResource
+	}{
+		{
+			name:     "no entries selects nothing",
+			disabled: []schema.GroupResource{configmaps, secrets, gr("example.com", "widgets")},
+		},
+		{
+			name:     "bare resource is core group",
+			entries:  []entryConfig{entry(deflate, "configmaps")},
+			enabled:  []schema.GroupResource{configmaps},
+			disabled: []schema.GroupResource{gr("apps", "configmaps"), pods},
+		},
+		{
+			name:     "resource dot group",
+			entries:  []entryConfig{entry(deflate, "widgets.example.com")},
+			enabled:  []schema.GroupResource{gr("example.com", "widgets")},
+			disabled: []schema.GroupResource{gr("", "widgets"), gr("example.com", "gadgets")},
+		},
+		{
+			name:     "group wildcard",
+			entries:  []entryConfig{entry(deflate, "*.example.com")},
+			enabled:  []schema.GroupResource{gr("example.com", "widgets"), gr("example.com", "gadgets")},
+			disabled: []schema.GroupResource{configmaps, gr("other.com", "widgets")},
+		},
+		{
+			name:     "core group wildcard",
+			entries:  []entryConfig{entry(deflate, "*.")},
+			enabled:  []schema.GroupResource{configmaps, pods},
+			disabled: []schema.GroupResource{gr("apps", "deployments")},
+		},
+		{
+			name:     "everything wildcard",
+			entries:  []entryConfig{entry(deflate, "*.*")},
+			enabled:  []schema.GroupResource{configmaps, gr("apps", "deployments"), gr("example.com", "widgets")},
+			disabled: []schema.GroupResource{secrets},
+		},
+		{
+			name:     "algorithm None selects nothing",
+			entries:  []entryConfig{entry(none, "*.*")},
+			disabled: []schema.GroupResource{configmaps, gr("apps", "deployments")},
+		},
+		{
+			name:     "earlier None excludes a resource from a later wildcard",
+			entries:  []entryConfig{entry(none, "events"), entry(deflate, "*.*")},
+			enabled:  []schema.GroupResource{configmaps, gr("apps", "deployments")},
+			disabled: []schema.GroupResource{events},
+		},
+		{
+			name:     "earlier None excludes a whole group from a later wildcard",
+			entries:  []entryConfig{entry(none, "*.coordination.k8s.io"), entry(deflate, "*.*")},
+			enabled:  []schema.GroupResource{configmaps},
+			disabled: []schema.GroupResource{gr("coordination.k8s.io", "leases")},
+		},
+		{
+			name:     "an earlier Deflate wins over a later None",
+			entries:  []entryConfig{entry(deflate, "configmaps"), entry(none, "*.")},
+			enabled:  []schema.GroupResource{configmaps},
+			disabled: []schema.GroupResource{pods},
+		},
+		{
+			name:     "secrets named explicitly",
+			entries:  []entryConfig{entry(deflate, "secrets")},
+			enabled:  []schema.GroupResource{secrets},
+			disabled: []schema.GroupResource{configmaps},
+		},
+		{
+			name:     "secrets named with None",
+			entries:  []entryConfig{entry(none, "secrets"), entry(deflate, "*.*")},
+			enabled:  []schema.GroupResource{configmaps},
+			disabled: []schema.GroupResource{secrets},
+		},
+		{
+			name:     "the core group wildcard does not reach secrets",
+			entries:  []entryConfig{entry(deflate, "*.")},
+			disabled: []schema.GroupResource{secrets},
+		},
+		{
+			name:    "secrets named after a wildcard still works, since no wildcard claims it",
+			entries: []entryConfig{entry(deflate, "*.*"), entry(deflate, "secrets")},
+			enabled: []schema.GroupResource{secrets, configmaps},
+		},
+		{
+			name:     "a secrets resource in another group is not the sensitive one",
+			entries:  []entryConfig{entry(deflate, "*.example.com")},
+			enabled:  []schema.GroupResource{gr("example.com", "secrets")},
+			disabled: []schema.GroupResource{secrets},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := mustConfig(t, tc.entries...)
+			for _, r := range tc.enabled {
+				if got := c.RuleFor(r).Algorithm; got != compression.AlgorithmDeflate {
+					t.Errorf("RuleFor(%s).Algorithm = %v, want AlgorithmDeflate", r, got)
+				}
+			}
+			for _, r := range tc.disabled {
+				if got := c.RuleFor(r).Algorithm; got != compression.AlgorithmNone {
+					t.Errorf("RuleFor(%s).Algorithm = %v, want AlgorithmNone", r, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRuleForMinSize checks minSize comes from the same entry as the algorithm,
+// so a wildcard can carry one threshold while a resource listed before it
+// carries another. An omitted minSize stays zero, which WithCompression reads
+// as its default.
+func TestRuleForMinSize(t *testing.T) {
+	c := mustConfig(t,
+		withMinSize(entry(deflate, "configmaps"), 256),
+		withMinSize(entry(none, "events"), 4096),
+		entry(deflate, "*.*"),
+	)
+	for gr, want := range map[schema.GroupResource]int{configmaps: 256, events: 4096, pods: 0, secrets: 0} {
+		if got := c.RuleFor(gr).MinSize; got != want {
+			t.Errorf("RuleFor(%s).MinSize = %d, want %d", gr, got, want)
+		}
+	}
+}
+
+// TestUnloadedConfigurationIsInert covers a server started without the flag
+// and a CompressionConfiguration built outside the loader.
+func TestUnloadedConfigurationIsInert(t *testing.T) {
+	for name, c := range map[string]*CompressionConfiguration{"nil": nil, "zero": {}} {
+		if got := c.RuleFor(configmaps); got != (compression.Rule{}) {
+			t.Errorf("%s: RuleFor(configmaps) = %+v, want the zero Rule", name, got)
+		}
+	}
+}
+
+// TestRulesReachTheTransformer follows a file to the bytes handed to
+// encryption, the way the storage factory will: RuleFor per resource, then
+// compression.WithCompression. An omitted minSize must come out as 1Ki.
+func TestRulesReachTheTransformer(t *testing.T) {
+	loaded, err := LoadCompressionConfig(writeConfig(t, validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		config     *CompressionConfiguration
+		gr         schema.GroupResource
+		size       int
+		wantFramed bool
+	}{
+		{loaded, configmaps, 2047, false},
+		{loaded, configmaps, 2048, true},
+		{loaded, pods, 1023, false},
+		{loaded, pods, 1024, true},
+		{loaded, events, 4096, false},
+		{loaded, secrets, 4096, false},
+		// No --storage-compression-config: the wiring still installs the transformer.
+		{nil, configmaps, 4096, false},
+	} {
+		t.Run(fmt.Sprintf("%s/%d/loaded=%v", tc.gr, tc.size, tc.config != nil), func(t *testing.T) {
+			tr := compression.WithCompression(identity.NewEncryptCheckTransformer(), tc.config.RuleFor(tc.gr), tc.gr)
+			data := bytes.Repeat([]byte("a"), tc.size)
+			dataCtx := value.DefaultContext("/registry/" + tc.gr.String())
+			stored, err := tr.TransformToStorage(context.Background(), data, dataCtx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if framed := stored[0] == 0x00; framed != tc.wantFramed {
+				t.Fatalf("framed = %v, want %v", framed, tc.wantFramed)
+			}
+			out, stale, err := tr.TransformFromStorage(context.Background(), stored, dataCtx)
+			if err != nil || stale || !bytes.Equal(out, data) {
+				t.Fatalf("round trip: stale %v, err %v", stale, err)
 			}
 		})
 	}
@@ -171,7 +397,7 @@ func firstMatch(entries []entryConfig, gr schema.GroupResource) (entryConfig, bo
 				wildcard = true
 			}
 		}
-		if wildcard && gr != compression.SecretsGroupResource {
+		if wildcard && gr != secrets {
 			return e, true
 		}
 	}
@@ -192,12 +418,12 @@ func masked(entries []entryConfig) bool {
 	return false
 }
 
-// TestValidatedPolicyFollowsFirstMatch tries every configuration of one or two
-// entries (one or two selectors each) and of three single-selector entries,
-// drawn from a fixed selector pool. Validation and Policy share
-// compression.CoveringSelectors, so this pins both to first-match-wins: masked
-// configs fail validation, and accepted ones pick the entry firstMatch picks.
-func TestValidatedPolicyFollowsFirstMatch(t *testing.T) {
+// TestRuleForFollowsFirstMatch tries every configuration of one or two entries
+// (one or two selectors each) and of three single-selector entries, drawn from a
+// fixed selector pool. Validation and RuleFor share CoveringSelectors, so this
+// pins both to first-match-wins: masked configs fail newCompressionConfiguration,
+// and accepted ones give each resource the Rule of the entry firstMatch picks.
+func TestRuleForFollowsFirstMatch(t *testing.T) {
 	selectors := []string{"configmaps", "secrets", "*.", "*.*", "*.apps", "deployments.apps", "widgets.example.com"}
 	var lists [][]string
 	for _, a := range selectors {
@@ -209,20 +435,19 @@ func TestValidatedPolicyFollowsFirstMatch(t *testing.T) {
 		}
 	}
 	probes := []schema.GroupResource{
-		{Resource: "configmaps"}, {Resource: "pods"}, compression.SecretsGroupResource, {Group: "example.com", Resource: "secrets"},
+		configmaps, pods, secrets, {Group: "example.com", Resource: "secrets"},
 		{Group: "apps", Resource: "deployments"}, {Group: "apps", Resource: "replicasets"},
 		{Group: "example.com", Resource: "widgets"}, {Group: "example.com", Resource: "gadgets"},
 	}
-	// Entry i gets minSize MinConfigurableMinSize+i, so MinSizeFor tells which entry won.
+	// Entry i gets minSize 64+i (64 is the floor), so the Rule shows which entry won.
 	build := func(lists ...[]string) []entryConfig {
 		entries := make([]entryConfig, len(lists))
 		for i, l := range lists {
-			alg := apiserver.CompressionAlgorithmDeflate
+			alg := deflate
 			if i%2 == 1 {
-				alg = apiserver.CompressionAlgorithmNone
+				alg = none
 			}
-			minSize := resource.NewQuantity(int64(compression.MinConfigurableMinSize+i), resource.BinarySI)
-			entries[i] = entryConfig{Resources: l, Algorithm: alg, MinSize: minSize}
+			entries[i] = withMinSize(entry(alg, l...), int64(64+i))
 		}
 		return entries
 	}
@@ -244,31 +469,52 @@ func TestValidatedPolicyFollowsFirstMatch(t *testing.T) {
 	accepted := 0
 	for _, entries := range configs {
 		name := fmt.Sprint(entries)
-		config := &apiserver.StorageCompressionConfiguration{Resources: entries}
-		errs := validation.ValidateStorageCompressionConfiguration(config)
-		if masked(entries) && len(errs) == 0 {
+		c, err := newCompressionConfiguration(&apiserverv1alpha1.StorageCompressionConfiguration{Resources: entries}, "")
+		if masked(entries) && err == nil {
 			t.Fatalf("%s: a masked configuration passed validation", name)
 		}
-		if len(errs) > 0 {
+		if err != nil {
 			continue
 		}
 		accepted++
-		p := compression.NewPolicy(config)
 		for _, probe := range probes {
-			want, ok := firstMatch(entries, probe)
-			wantEnabled, wantMinSize := false, compression.DefaultMinSize
-			if ok {
-				wantEnabled, wantMinSize = want.Algorithm == apiserver.CompressionAlgorithmDeflate, int(want.MinSize.Value())
+			var want compression.Rule
+			if e, ok := firstMatch(entries, probe); ok {
+				want.MinSize = int(e.MinSize.Value())
+				if e.Algorithm == deflate {
+					want.Algorithm = compression.AlgorithmDeflate
+				}
 			}
-			if got := p.EnabledFor(probe); got != wantEnabled {
-				t.Fatalf("%s: EnabledFor(%s) = %v, want %v", name, probe, got, wantEnabled)
-			}
-			if got := p.MinSizeFor(probe); got != wantMinSize {
-				t.Fatalf("%s: MinSizeFor(%s) = %d, want %d", name, probe, got, wantMinSize)
+			if got := c.RuleFor(probe); got != want {
+				t.Fatalf("%s: RuleFor(%s) = %+v, want %+v", name, probe, got, want)
 			}
 		}
 	}
 	if accepted == 0 || accepted == len(configs) {
 		t.Fatalf("%d of %d configurations accepted; the generator isn't exercising both outcomes", accepted, len(configs))
+	}
+}
+
+// TestNewCompressionConfigurationValidates checks that the only constructor
+// rejects what validation rejects, so no CompressionConfiguration holds rules
+// from an invalid file.
+func TestNewCompressionConfigurationValidates(t *testing.T) {
+	for name, config := range map[string]*apiserverv1alpha1.StorageCompressionConfiguration{
+		"nil":                       nil,
+		"no resources":              {Resources: []entryConfig{entry(deflate)}},
+		"missing algorithm":         {Resources: []entryConfig{entry("", "configmaps")}},
+		"unknown algorithm":         {Resources: []entryConfig{entry("Zstd", "configmaps")}},
+		"minSize below the floor":   {Resources: []entryConfig{withMinSize(entry(deflate, "configmaps"), 63)}},
+		"bare wildcard":             {Resources: []entryConfig{entry(deflate, "*")}},
+		"masked selector":           {Resources: []entryConfig{entry(deflate, "*.*"), entry(none, "configmaps")}},
+		"minSize at the ceiling":    {Resources: []entryConfig{withMinSize(entry(deflate, "configmaps"), 1472*1024)}},
+		"selector repeated in list": {Resources: []entryConfig{entry(deflate, "configmaps", "configmaps.")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := newCompressionConfiguration(config, "")
+			if err == nil || c != nil {
+				t.Fatalf("newCompressionConfiguration() = %+v, %v, want only a validation error", c, err)
+			}
+		})
 	}
 }
